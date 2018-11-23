@@ -223,28 +223,133 @@ def resnet152(pretrained=False, **kwargs):
 
     return model
 
+from sklearn import svm
+import json
+import pickle
+import os
+import base64
+import numpy as np
+
+from rafiki.model import BaseModel, InvalidModelParamsException, test_model_class
+from rafiki.constants import TaskType, ModelDependency
+
+
+class SingaResNet(BaseModel):
+    '''
+    Implements ResNet using Singa for simple image classification
+    '''
+
+    def get_knob_config(self):
+        return {
+            'knobs': {
+                'max_epoch': {
+                    'type': 'int',
+                    'range': [10, 10]
+                },
+                'lr': {
+                    'type': 'float_exp',
+                    'range': [1e-1, 1e-4]
+                }
+            }
+        }
+
+    def init(self, knobs):
+        self._max_epoch = knobs.get('max_epoch')
+        self._lr = knobs.get('lr')
+        self._clf = resnet18()
+
+    def train(self, dataset_uri):
+        dataset = self.utils.load_dataset_of_image_files(dataset_uri)
+        (images, classes) = zip(*[(image, image_class)
+                                  for (image, image_class) in dataset])
+        X = np.array(self._prepare_X(images),
+                     dtype=np.float32).transpose(0, 1, 2)
+        y = np.array(classes, dtype=np.int)
+
+        print('Start intialization............')
+        dev = device.create_cuda_gpu_on(0)
+        #dev = device.create_cuda_gpu()
+        batch_size = 16
+        IMG_SIZE = 224
+        sgd = opt.SGD(lr=0.1, momentum=0.9, weight_decay=1e-5)
+
+        tx = tensor.Tensor((batch_size, 3, IMG_SIZE, IMG_SIZE), dev)
+        ty = tensor.Tensor((batch_size,), dev, tensor.int32)
+        autograd.training = True
+
+        for epoch in range(max_epoch):
+            with trange(niters) as t:
+                for b in t:
+                    tx.copy_from_numpy(x)
+                    ty.copy_from_numpy(y)
+                    x = model(tx)
+                    loss = autograd.softmax_cross_entropy(x, ty)
+                    for p, g in autograd.backward(loss):
+                        # print(p.shape, g.shape)
+                        sgd.update(p, g)
+
+    def evaluate(self, dataset_uri):
+        dataset = self.utils.load_dataset_of_image_files(dataset_uri)
+        (images, classes) = zip(*[(image, image_class)
+                                  for (image, image_class) in dataset])
+        X = self._prepare_X(images)
+        y = classes
+        preds = self._clf.predict(X)
+        accuracy = sum(y == preds) / len(y)
+        return accuracy
+
+    def predict(self, queries):
+        X = self._prepare_X(queries)
+        probs = self._clf.predict_proba(X)
+        return probs.tolist()
+
+    def destroy(self):
+        pass
+
+    def dump_parameters(self):
+        params = {}
+
+        # Save model parameters
+        clf_bytes = pickle.dumps(self._clf)
+        clf_base64 = base64.b64encode(clf_bytes).decode('utf-8')
+        params['clf_base64'] = clf_base64
+
+        return params
+
+    def load_parameters(self, params):
+        # Load model parameters
+        clf_base64 = params.get('clf_base64', None)
+        if clf_base64 is None:
+            raise InvalidModelParamsException()
+
+        clf_bytes = base64.b64decode(params['clf_base64'].encode('utf-8'))
+        self._clf = pickle.loads(clf_bytes)
+
+    def _prepare_X(self, images):
+        return [np.asarray(image).flatten() for image in images]
+
+    def _build_classifier(self, max_iter, kernel, gamma, C):
+        clf = svm.SVC(
+            max_iter=max_iter,
+            kernel=kernel,
+            gamma=gamma,
+            C=C,
+            probability=True
+        )
+        return clf
+
 
 if __name__ == '__main__':
-    model = resnet18()
-    print('Start intialization............')
-    dev = device.create_cuda_gpu_on(0)
-    #dev = device.create_cuda_gpu()
-    niters = 200
-    batch_size = 16
-    IMG_SIZE = 224
-    sgd = opt.SGD(lr=0.1, momentum=0.9, weight_decay=1e-5)
+    test_model_class(
+        model_file_path=__file__,
+        model_class='SkSvm',
+        task=TaskType.IMAGE_CLASSIFICATION,
+        dependencies={
+            ModelDependency.SCIKIT_LEARN: '0.20.0'
+        },
+        train_dataset_uri='data/fashion_mnist_for_image_classification_train.zip',
+        test_dataset_uri='data/fashion_mnist_for_image_classification_test.zip',
+    )
 
-    tx = tensor.Tensor((batch_size, 3, IMG_SIZE, IMG_SIZE), dev)
-    ty = tensor.Tensor((batch_size,), dev, tensor.int32)
-    autograd.training = True
 
-    for epoch in range(max_epoch):
-        with trange(niters) as t:
-            for b in t:
-                tx.copy_from_numpy(x)
-                ty.copy_from_numpy(y)
-                x = model(tx)
-                loss = autograd.softmax_cross_entropy(x, ty)
-                for p, g in autograd.backward(loss):
-                    # print(p.shape, g.shape)
-                    sgd.update(p, g)
+if __name__ == '__main__':
