@@ -39,6 +39,13 @@ def conv3x3(in_planes, out_planes, stride=1):
                            padding=1, bias=False)
 
 
+def accuracy(pred, target):
+    y = np.argmax(pred, axis=1)
+    t = np.argmax(target, axis=1)
+    a = y == t
+    return np.array(a, 'int').sum() / float(len(t))
+
+
 class BasicBlock(autograd.Layer):
     expansion = 1
 
@@ -250,58 +257,104 @@ class SingaResNet(BaseModel):
                     'type': 'float_exp',
                     'range': [1e-1, 1e-4]
                 }
+                'batch_size': {
+                    'type': 'int_cat',
+                    'range': [16, 32, 64, 128, 256]
+                }
+                'weight_decay': {
+                    'type': 'float_exp',
+                    'range': '1e-3, 1e-5'
+                }
+                'momentum': {
+                    'type': 'float',
+                    'range': [0.5, 0.9]
+                }
             }
         }
 
     def init(self, knobs):
         self._max_epoch = knobs.get('max_epoch')
         self._lr = knobs.get('lr')
-        self._clf = resnet18()
+        self._batch_size = knobs.get('batch_size')
+        self._weight_decay = knobs.get('weight_decay')
+        self._momentum = knobs.get('momentum')
+        self._clf = resnet18()  # TODO(wangwei) make it an hyperparameter
+        self.dev = device.create_cuda_gpu_on(0)
 
     def train(self, dataset_uri):
         dataset = self.utils.load_dataset_of_image_files(dataset_uri)
+        # TODO(wangwei) load images in batch
         (images, classes) = zip(*[(image, image_class)
                                   for (image, image_class) in dataset])
         X = np.array(self._prepare_X(images),
                      dtype=np.float32).transpose(0, 1, 2)
         y = np.array(classes, dtype=np.int)
 
-        print('Start intialization............')
-        dev = device.create_cuda_gpu_on(0)
-        #dev = device.create_cuda_gpu()
-        batch_size = 16
-        IMG_SIZE = 224
-        sgd = opt.SGD(lr=0.1, momentum=0.9, weight_decay=1e-5)
+        self.utils.log('Start intialization............')
+        bs = self._batch_size
+        sgd = opt.SGD(lr=self._lr, momentum=self._momentum,
+                      weight_decay=self._weight_decay)
 
-        tx = tensor.Tensor((batch_size, 3, IMG_SIZE, IMG_SIZE), dev)
-        ty = tensor.Tensor((batch_size,), dev, tensor.int32)
+        c, h, w = X.shape[1:]
+        tx = tensor.Tensor((bs, c, h, w), self.dev)
+        ty = tensor.Tensor((bs,), self.dev, tensor.int32)
         autograd.training = True
-
+        self.utils.define_loss_plot()
+        self.utils.log('Start training............')
         for epoch in range(max_epoch):
-            with trange(niters) as t:
-                for b in t:
-                    tx.copy_from_numpy(x)
-                    ty.copy_from_numpy(y)
-                    x = model(tx)
-                    loss = autograd.softmax_cross_entropy(x, ty)
-                    for p, g in autograd.backward(loss):
-                        # print(p.shape, g.shape)
-                        sgd.update(p, g)
+            niters = X.shape[0] // bs
+            pacc, ploss = 0.0, 0.0
+            for b in range(niters):
+                tx.copy_from_numpy(X[niters * bs: niters * bs + bs])
+                ty.copy_from_numpy(y[niters * bs:niters * bs + bs])
+                p = model(tx)
+                loss = autograd.softmax_cross_entropy(p, ty)
+                for p, g in autograd.backward(loss):
+                    # print(p.shape, g.shape)
+                    sgd.update(p, g)
+                ploss = ploss * 0.9 + loss.to_numpy().average() * 0.1
+                # p.to_numpy must be after loss.to_numpy
+                acc = accuracy(p.to_numpy(), y[niters * bs:niters * bs + bs])
+                pacc = pacc * 0.9 + acc * 0. 1
+            # self.utils.log('Train loss: {}'.format(accum_loss))
+            self.utils.log_loss_metric(accum_loss)
+        self.utils.log('Finish training............')
 
     def evaluate(self, dataset_uri):
         dataset = self.utils.load_dataset_of_image_files(dataset_uri)
         (images, classes) = zip(*[(image, image_class)
                                   for (image, image_class) in dataset])
-        X = self._prepare_X(images)
-        y = classes
-        preds = self._clf.predict(X)
-        accuracy = sum(y == preds) / len(y)
-        return accuracy
+
+        dev = device.create_cuda_gpu_on(0)
+        #dev = device.create_cuda_gpu()
+        bs = self._batch_size
+
+        c, h, w = X.shape[1:]
+        tx = tensor.Tensor((bs, c, h, w), self.dev)
+        ty = tensor.Tensor((bs,), self.dev, tensor.int32)
+        autograd.training = False
+
+        niters = X.shape[0] // bs
+        ploss, pacc = 0.0, 0.0
+        for b in range(niters):
+            tx.copy_from_numpy(X[niters * bs: niters * bs + bs])
+            ty.copy_from_numpy(y[niters * bs:niters * bs + bs])
+            p = model(tx)
+            loss = autograd.softmax_cross_entropy(p, ty)
+
+            ploss += loss.to_numpy().average()
+            pacc += accuracy(p.to_numpy, y[niters * bs:niters * bs + bs])
+        # self.utils.log('Evaluation loss: {}'.format(accum_loss))
+        self.utils.log_loss_metric(ploss / niters)
+        return pacc / niters
 
     def predict(self, queries):
         X = self._prepare_X(queries)
-        probs = self._clf.predict_proba(X)
-        return probs.tolist()
+        tx = tensor.Tensor(X.shape, self.dev)
+        autograd.training = False
+        tx.copy_from_numpy(X[niters * bs: niters * bs + bs])
+        probs = model(tx)
+        return probs.to_numpy().tolist()
 
     def destroy(self):
         pass
@@ -327,16 +380,6 @@ class SingaResNet(BaseModel):
 
     def _prepare_X(self, images):
         return [np.asarray(image).flatten() for image in images]
-
-    def _build_classifier(self, max_iter, kernel, gamma, C):
-        clf = svm.SVC(
-            max_iter=max_iter,
-            kernel=kernel,
-            gamma=gamma,
-            C=C,
-            probability=True
-        )
-        return clf
 
 
 if __name__ == '__main__':
